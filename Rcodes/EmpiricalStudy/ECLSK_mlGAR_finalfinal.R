@@ -18,13 +18,15 @@ required_packages <- c("mvtnorm", "Matrix", "dplyr", "rjags",
                        "data.table", "nlme")
 lapply(required_packages, require, character.only = TRUE)
 
-work_path <- "~/XXYDATAanalysis/GoHiARmodel/substantivedata"
+# work_path <- "~/XXYDATAanalysis/GoHiARmodel/substantivedata"
+work_path <- "/Users/xiaoyuexiong/XXYDATAanalysis/IP1-DetrendingPanelTimeSeries/CodesAndResultsForRevision/RevisedEmpirical"
 setwd(work_path)
 
 r=2023
-C="ECLSK_Fixed_fixedtheta3andMean"
-Condi = "Single_Stage_2_large"
-dateMark="0709"
+# C="ECLSK_Fixed_fixedtheta3andMean"
+C="ECLSK"
+Condi = "mlGAR"
+dateMark="2501final"
 
 set.seed(r)
 
@@ -225,16 +227,23 @@ for (i in ids){ #i=2
   subset_i = subset(data_fit_equtime,id==i)
   Obs[,,p] = as.matrix(subset_i[,-1])
   p=p+1
-} #@@@ it should be noted that Obs[,,p] doesn't correspond to id=p
+} #it should be noted that Obs[,,p] doesn't correspond to id=p
 Obs[,,2]  # data for id=1; columns = (time, y1)
 
+is_observed = array(Obs_empty,dim=c(nT, (ydim+1), length(ids)))
+for(p in 1:length(ids)){
+  for(t in 1:nT){
+    is_observed[t,2,p] = ifelse(!is.na(Obs[t,2,p]), 1, 0)
+  }
+}
 #------------------- MCMC -------------------
 # Create a list of all the variables 
-jagsData <- list("ids" = ids, "nT" = nT, "Obs" = Obs,
+jagsData <- list("ids" = ids, "nT" = nT,"nP"=length(ids), "Obs" = Obs,
                  "theta10_start" = theta10_start,
                  "theta20_start" = theta20_start,
-                 "theta30_start" = theta30_start)
-
+                 "theta30_start" = theta30_start,
+                 "is_observed" = is_observed)
+load.module("dic")
 # Specify the Structured Latent Curve Model
 SLCmodel_0 = cat("
 model {
@@ -243,10 +252,12 @@ model {
 
     Obs[1,2,id]~dnorm(MU[id,1],1/IIV)
     MU[id,1]<-MU_thetas[id,1]*exp(-MU_thetas[id,2]*exp(-Obs[1,1,id]*MU_thetas[id,3]))-3
-    
+    log_lik[id,1] <- logdensity.norm(Obs[1,2,id], MU[id,1], 1/IIV)* is_observed[1,2,id]
+      
     for (t in 2:nT) { 
       Obs[t,2,id] ~ dnorm(MU[id,t] + AR[id]*(Obs[t-1,2,id]-MU[id,t-1]), 1/IIV)
       MU[id,t] <- MU_thetas[id,1]*exp(-MU_thetas[id,2]*exp(-Obs[t,1,id]*MU_thetas[id,3]))-3
+      log_lik[id,t] <- logdensity.norm(Obs[t,2,id], MU[id,t], 1/IIV)* is_observed[t,2,id]
     } 
     
 # PART 2. Specifying Level-2 model # should match data generation
@@ -265,22 +276,26 @@ model {
   # MU
     Level2Mean_theta1 ~ dunif(3.5,5.5)
     Level2Mean_theta2 ~ dunif(0,1.5)
-    Level2Mean_theta3 = 0.596
+    Level2Mean_theta3 = 0.596 #~ dunif(0.1,0.8)#= 0.596
     
     Level2Sd_theta1 ~ dunif(0,0.9)
     Level2Sd_theta2 ~ dunif(0,0.4)
     #log_Level2Sd_theta3 ~ dunif(-6.9077553,-0.9162907) #log(c(0.001,0.4))
     #Level2Sd_theta3 = exp(log_Level2Sd_theta3)
-    #Level2Sd_theta3 ~ dunif(0,0.4)
+    #Level2Sd_theta3 ~ dunif(0,0.3)
     
     Level2Var_theta1 = pow(Level2Sd_theta1,2)
     Level2Var_theta2 = pow(Level2Sd_theta2,2)
-    Level2Var_theta3 = 0.0001
+    Level2Var_theta3 = 0.0001#pow(Level2Sd_theta3,2)
     
   # IIV # IIV = 1
     IIV <- exp(logIIV)   
     logIIV ~ dunif(-13.81551, 0) #log(c(0.001^2,1^2))
     #IIV ~ dunif(0,0.5)
+    
+    # compute deviance
+    total_log_lik <- sum(log_lik[1:nP, 1:nT])
+    Dev <- -2 * total_log_lik
 }
 ",file = file_model)
 
@@ -288,7 +303,7 @@ model {
 summ_rownames = c("IIV",
                   "Level2MeanAR","Level2Var_AR",
                   "Level2Mean_theta1","Level2Mean_theta2","Level2Mean_theta3",
-                  "Level2Var_theta1","Level2Var_theta2","Level2Var_theta3")
+                  "Level2Var_theta1","Level2Var_theta2","Level2Var_theta3","Dev","deviance")
 parameters <- c(summ_rownames)#"AR","MU","MU_thetas",
 
 # Specifying sampler settings
@@ -309,7 +324,9 @@ jagsModel<-jags.model(file_model,data=jagsData,n.chains=chains,n.adapt=adaptatio
 # Running burn-in iterations
 update(jagsModel,n.iter=burnin)
 # Drawing posterior samples
-codaSamples<-coda.samples(jagsModel,variable.names=parameters,n.iter=nrOfIter, thin = thinning,seed=5)
+codaSamples<-coda.samples(jagsModel,variable.names=parameters,
+                          n.iter=nrOfIter, thin = thinning,seed=5,
+                          monitor="deviance")
 
 main_t_end <- proc.time()
 main_t_elapsed <- main_t_end - main_t_start
