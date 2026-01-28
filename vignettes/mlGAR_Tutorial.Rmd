@@ -40,7 +40,7 @@ Longitudinal data often contain two types of change processes:
 
 2.  **Intraindividual Variability**: Nuanced, usually reversible patterns of state fluctuations or short-term sequential dependencies whose effects diminish relatively quickly over time.
 
-Failure to account for trends when they are present—or improper detrending due to misspecification of the functional forms of trend processes and associated interindividual differences—can introduce spurious sequential dependencies in the data. The ml-GAR model addresses this challenge by integrating trend and autoregressive (AR) modeling in a single-stage Bayesian framework.
+Failure to account for trends when they are presentâ€”or improper detrending due to misspecification of the functional forms of trend processes and associated interindividual differencesâ€”can introduce spurious sequential dependencies in the data. The ml-GAR model addresses this challenge by integrating trend and autoregressive (AR) modeling in a single-stage Bayesian framework.
 
 ## Model Overview
 
@@ -52,18 +52,18 @@ The ml-GAR model integrates two key components:
 
 ### Mathematical Formulation
 
-For person $i$ at time $t$, the observation model is:
+For person $i$ at time $t$, the observation model is (Equation 1 in the paper):
 
 $$
-Y_{i,t} = s_{t,i} + g_{t,i}
+y_{t,i} = \tau_{t,i} + \eta_{t,i}
 $$
 
-where $s_{t,i}$ represents the trend component and $g_{t,i}$ represents the state fluctuation component.
+where $\tau_{t,i}$ represents the trend component and $\eta_{t,i}$ represents the state fluctuation component.
 
-**Trend Component (Gompertz Growth Curve):**
+**Trend Component (Gompertz Growth Curve, Equation 2):**
 
 $$
-s_{t,i} = \theta_{1,i} \exp\left(-\theta_{2,i} \exp(-t \cdot \theta_{3,i})\right)
+\tau_{t,i} = \theta_{1,i} \exp\left[-\theta_{2,i} \exp(-t \cdot \theta_{3,i})\right]
 $$
 
 where:
@@ -75,7 +75,7 @@ where:
 **State Fluctuation Component (AR Process):**
 
 $$
-g_{t,i} = \phi_i \cdot g_{t-1,i} + u_{t,i}, \quad u_{t,i} \sim N(0, \sigma^2_u)
+\eta_{t,i} = \phi_i \cdot \eta_{t-1,i} + u_{t,i}, \quad u_{t,i} \sim N(0, \sigma^2_u)
 $$
 
 where:
@@ -96,10 +96,11 @@ $$
 
 > **Note on notation**: In the accompanying code (and this tutorial), we use the following correspondences with the paper:
 >
-> - `MU_thetas[id,k]` corresponds to $\theta_{k,i}$ in the paper
+> - `MU[id,t]` corresponds to $\tau_{t,i}$ in the paper (Gompertz trend)
+> - `MU_thetas[id,k]` corresponds to $\theta_{k,i}$ (person-specific Gompertz parameters)
+> - `AR[id]` corresponds to $\phi_i$ (person-specific AR coefficient)
 > - `Level2Mean_thetak` corresponds to $\mu_{\theta_k}$ (population mean)
 > - `Level2Var_thetak` corresponds to $\sigma^2_{\theta_k}$ (random effect variance)
-> - `AR[id]` corresponds to $\phi_i$ (person-specific AR coefficient)
 > - `Level2MeanAR` corresponds to $\mu_\phi$ (mean AR)
 > - `Level2Var_AR` corresponds to $\sigma^2_\phi$ (variance of AR)
 > - `IIV` corresponds to $\sigma^2_u$ (process noise variance)
@@ -339,9 +340,9 @@ generate_mlGAR_data <- function(nP = 150, nT = 15, seed = 123) {
   
   # ---- Initialize Storage ----
   
-  Y <- matrix(NA, nrow = nP, ncol = nT)          # Observed variable
-  MU <- matrix(NA, nrow = nP, ncol = nT)         # Trend (Gompertz) values
-  g <- matrix(NA, nrow = nP, ncol = nT)          # State fluctuations
+  Y <- matrix(NA, nrow = nP, ncol = nT)          # Observed variable (y in paper)
+  MU <- matrix(NA, nrow = nP, ncol = nT)         # Trend values (tau in paper)
+  g <- matrix(NA, nrow = nP, ncol = nT)          # State fluctuations (eta in paper)
   
   theta1 <- rep(NA, nP)  # Person-specific asymptote
   theta2 <- rep(NA, nP)  # Person-specific displacement
@@ -454,7 +455,7 @@ legend("bottomright",
 # Plot state fluctuations
 plot(simdata$time, simdata$g[sample_ids[1], ], type = "l", col = colors[1],
      ylim = range(simdata$g[sample_ids, ]), lwd = 1.5,
-     xlab = "Time", ylab = expression(g[t*","*i]), 
+     xlab = "Time", ylab = expression(eta[t*","*i]), 
      main = "State Fluctuations (AR Process)")
 abline(h = 0, lty = 3, col = "gray")
 
@@ -522,13 +523,13 @@ for (id in ids) { # opening loop for person (id)
 
 **Key points about the observation model:**
 
--   `MU[id,t]`: The Gompertz trend for person `id` at time `t`, computed as $\theta_{1,i} \exp(-\theta_{2,i} \exp(-t \cdot \theta_{3,i}))$
--   `AR[id]*(Obs[t-1,2,id]-MU[id,t-1])`: The AR component captures carry-over from the previous deviation
--   `1/IIV`: JAGS uses precision (inverse variance), so we specify `1/IIV` where `IIV` is the process noise variance
+-   `MU[id,t]`: The Gompertz trend ($\tau_{t,i}$) for person `id` at time `t`, computed as $\theta_{1,i} \exp[-\theta_{2,i} \exp(-t \cdot \theta_{3,i})]$
+-   `AR[id]*(Obs[t-1,2,id]-MU[id,t-1])`: The AR component captures carry-over from the previous deviation ($\eta_{t-1,i}$)
+-   `1/IIV`: JAGS uses precision (inverse variance), so we specify `1/IIV` where `IIV` is the process noise variance ($\sigma^2_u$)
 
 ### Level-2 Model: Person-Specific Parameters
 
-The person-specific parameters are drawn from normal distributions centered at the population means. Note that the individual AR coefficients (`AR[id]`) are **not** truncated—only the population mean (`Level2MeanAR`) has the stationarity constraint:
+The person-specific parameters are drawn from normal distributions centered at the population means. Note that the individual AR coefficients (`AR[id]`) are **not** truncatedâ€”only the population mean (`Level2MeanAR`) has the stationarity constraint:
 
 ``` jags
 # PART 2. Specifying Level-2 model
@@ -911,9 +912,9 @@ sessionInfo()
 
 # References
 
--   Asparouhov, T., & Muthén, B. (2010). Bayesian analysis using Mplus: Technical implementation. Muthén & Muthén.
+-   Asparouhov, T., & MuthÃ©n, B. (2010). Bayesian analysis using Mplus: Technical implementation. MuthÃ©n & MuthÃ©n.
 -   Gates, K. M., Chow, S.-M., & Molenaar, P. C. M. (2023). *Intensive longitudinal analysis of human processes*. Chapman and Hall/CRC.
--   Ji, L., Chow, S.-M., Schermerhorn, A. C., Jacobson, N. C., & Cummings, E. M. (2020). Handling missing data in the modeling of intensive longitudinal data. *Structural Equation Modeling: A Multidisciplinary Journal*, 27(5), 715–736.
--   Li, Y., Oravecz, Z., Zhou, S., Bodber, Y., & Chow, S.-M. (2022). Bayesian forecasting with a regime-switching zero-inflated multilevel Poisson regression model: An application to adolescent alcohol use with selective missingness. *Psychometrika*, 87(3), 978–1008.
+-   Ji, L., Chow, S.-M., Schermerhorn, A. C., Jacobson, N. C., & Cummings, E. M. (2020). Handling missing data in the modeling of intensive longitudinal data. *Structural Equation Modeling: A Multidisciplinary Journal*, 27(5), 715â€“736.
+-   Li, Y., Oravecz, Z., Zhou, S., Bodber, Y., & Chow, S.-M. (2022). Bayesian forecasting with a regime-switching zero-inflated multilevel Poisson regression model: An application to adolescent alcohol use with selective missingness. *Psychometrika*, 87(3), 978â€“1008.
 -   Plummer, M. (2003). JAGS: A program for analysis of Bayesian graphical models using Gibbs sampling. In *Proceedings of the 3rd International Workshop on Distributed Statistical Computing*.
 -   Xiong, X., Li, Y., Hunter, M. D., & Chow, S.-M. (2025). Integrated trend and lagged modeling of multi-subject, multilevel, and short time series. *Multivariate Behavioral Research*. https://doi.org/10.1080/00273171.2025.2587286
