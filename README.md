@@ -37,23 +37,32 @@ Basic steps:
 
 ## Model structure
 
-Observation model:
+Observation model (Equation 1 in the paper):
 
-$$Y_{i,t} = s_{t,i} + g_{t,i}$$
+$$y_{t,i} = \tau_{t,i} + \eta_{t,i}$$
 
-where $s_{t,i}$ is the Gompertz trend and $g_{t,i}$ is the AR(1) state process.
+where $\tau_{t,i}$ is the Gompertz trend and $\eta_{t,i}$ is the AR(1) state fluctuation.
 
-Trend component:
+Trend component (Equation 2):
 
-$$s_{t,i} = \theta_{1,i} \exp\left(-\theta_{2,i} \exp(-t \cdot \theta_{3,i})\right)$$
+$$\tau_{t,i} = \theta_{1,i} \exp\left[-\theta_{2,i} \exp(-t \cdot \theta_{3,i})\right]$$
 
-The three parameters are asymptote ($\theta_1$), displacement ($\theta_2$), and growth rate ($\theta_3$).
+The three Gompertz parameters are asymptote ($\theta_1$), displacement ($\theta_2$), and growth rate ($\theta_3$).
 
 State component:
 
-$$g_{t,i} = \phi_i \cdot g_{t-1,i} + u_{t,i}, \quad u_{t,i} \sim N(0, \sigma^2_u)$$
+$$\eta_{t,i} = \phi_i \cdot \eta_{t-1,i} + u_{t,i}, \quad u_{t,i} \sim N(0, \sigma^2_u)$$
 
-All person-level parameters have random effects following normal distributions.
+All person-level parameters follow normal distributions at Level 2.
+
+**Notation correspondence (code → paper):**
+
+| Code | Paper |
+|------|-------|
+| `MU[id,t]` | $\tau_{t,i}$ |
+| `MU_thetas[id,k]` | $\theta_{k,i}$ |
+| `AR[id]` | $\phi_i$ |
+| `IIV` | $\sigma^2_u$ |
 
 ## Priors
 
