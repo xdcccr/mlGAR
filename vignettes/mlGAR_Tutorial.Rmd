@@ -1,0 +1,919 @@
+---
+title: "Integrated Trend and Lagged Modeling of Multi-Subject, Multilevel, and Short Time Series: A Tutorial"
+subtitle: "Multilevel Growth with Autoregressive Residuals (ml-GAR)"
+author: "Xiaoyue Xiong, Yanling Li, Michael D. Hunter & Sy-Miin Chow"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: cosmo
+    highlight: tango
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  cache = TRUE,
+  fig.width = 8, 
+  fig.height = 6
+)
+```
+
+# Introduction
+
+This tutorial demonstrates the implementation of the **Multilevel Growth with Autoregressive Residuals (ml-GAR)** model, a Bayesian approach for simultaneously modeling trend and intraindividual variability in multi-subject, multilevel, and short time series data. This model is particularly useful for analyzing longitudinal panel data where both gradual developmental trends and momentary fluctuations occur.
+
+## Background and Motivation
+
+Longitudinal data often contain two types of change processes:
+
+1.  **Trends (Intraindividual Change)**: Gradual, smoothly-varying functions of time that capture long-term variations in a time series.
+
+2.  **Intraindividual Variability**: Nuanced, usually reversible patterns of state fluctuations or short-term sequential dependencies whose effects diminish relatively quickly over time.
+
+Failure to account for trends when they are present—or improper detrending due to misspecification of the functional forms of trend processes and associated interindividual differences—can introduce spurious sequential dependencies in the data. The ml-GAR model addresses this challenge by integrating trend and autoregressive (AR) modeling in a single-stage Bayesian framework.
+
+## Model Overview
+
+The ml-GAR model integrates two key components:
+
+1.  **Multilevel Gompertz Growth Curve**: Captures gradual, nonlinear trend processes through person-specific asymptote ($\theta_{1,i}$), displacement ($\theta_{2,i}$), and growth rate ($\theta_{3,i}$) parameters.
+
+2.  **Multilevel Autoregressive (AR) Component**: Models temporal dependencies in the deviations from the trend, where the current observation depends on the previous deviation.
+
+### Mathematical Formulation
+
+For person $i$ at time $t$, the observation model is:
+
+$$
+Y_{i,t} = s_{t,i} + g_{t,i}
+$$
+
+where $s_{t,i}$ represents the trend component and $g_{t,i}$ represents the state fluctuation component.
+
+**Trend Component (Gompertz Growth Curve):**
+
+$$
+s_{t,i} = \theta_{1,i} \exp\left(-\theta_{2,i} \exp(-t \cdot \theta_{3,i})\right)
+$$
+
+where:
+
+-   $\theta_{1,i}$: Asymptote parameter (upper limit of growth)
+-   $\theta_{2,i}$: Displacement parameter (horizontal shift)
+-   $\theta_{3,i}$: Growth rate parameter (steepness of the curve)
+
+**State Fluctuation Component (AR Process):**
+
+$$
+g_{t,i} = \phi_i \cdot g_{t-1,i} + u_{t,i}, \quad u_{t,i} \sim N(0, \sigma^2_u)
+$$
+
+where:
+
+-   $\phi_i$: Person-specific AR coefficient
+-   $u_{t,i}$: Process noise (innovation)
+
+**Multilevel Structure:**
+
+The person-specific parameters follow normal distributions:
+
+$$
+\begin{aligned}
+\theta_{k,i} &\sim N(\mu_{\theta_k}, \sigma^2_{\theta_k}), \quad k = 1, 2, 3 \\
+\phi_i &\sim N(\mu_\phi, \sigma^2_\phi)
+\end{aligned}
+$$
+
+> **Note on notation**: In the accompanying code (and this tutorial), we use the following correspondences with the paper:
+>
+> - `MU_thetas[id,k]` corresponds to $\theta_{k,i}$ in the paper
+> - `Level2Mean_thetak` corresponds to $\mu_{\theta_k}$ (population mean)
+> - `Level2Var_thetak` corresponds to $\sigma^2_{\theta_k}$ (random effect variance)
+> - `AR[id]` corresponds to $\phi_i$ (person-specific AR coefficient)
+> - `Level2MeanAR` corresponds to $\mu_\phi$ (mean AR)
+> - `Level2Var_AR` corresponds to $\sigma^2_\phi$ (variance of AR)
+> - `IIV` corresponds to $\sigma^2_u$ (process noise variance)
+
+# Prerequisites
+
+## Required Packages
+
+```{r load-packages}
+# Load required packages
+library(rjags)      # Interface to JAGS for Bayesian modeling
+load.module("dic")  # Load DIC module for model comparison
+library(coda)       # MCMC diagnostics and summaries
+library(ggplot2)    # Visualization
+library(MASS)       # For mvrnorm
+```
+
+## Post-Processing Functions
+
+The following functions are used for summarizing MCMC output. The `HDIofMCMC` function computes the Highest Density Interval (HDI), and `summarizePost` provides comprehensive summary statistics for all monitored parameters.
+
+```{r postcalc-functions}
+#' Compute Highest Density Interval (HDI) from MCMC samples
+#'
+#' @param sampleVec A vector of MCMC samples
+#' @param credMass Credible mass for the interval (default: 0.95)
+#' @return A vector with HDI lower and upper bounds
+HDIofMCMC <- function(sampleVec, credMass = 0.95) {
+  sortedPts <- sort(sampleVec)
+  ciIdxInc <- ceiling(credMass * length(sortedPts))
+  nCIs <- length(sortedPts) - ciIdxInc
+  ciWidth <- rep(0, nCIs)
+  for (i in 1:nCIs) {
+    ciWidth[i] <- sortedPts[i + ciIdxInc] - sortedPts[i]
+  }
+  HDImin <- sortedPts[which.min(ciWidth)]
+  HDImax <- sortedPts[which.min(ciWidth) + ciIdxInc]
+  HDIlim <- c(HDImin, HDImax)
+  return(HDIlim)
+}
+
+#' Comprehensive MCMC Summary Statistics
+#'
+#' @param samples An mcmc.list object from coda.samples()
+#' @param credMass Credible mass for HDI (default: 0.95)
+#' @param CI Quantiles for credible intervals (default: c(.025, .975))
+#' @return A data.frame with summary statistics for each parameter
+summarizePost <- function(samples, credMass = 0.95, CI = c(.025, .975)) {
+  
+  # Ensure samples is a list
+  if (!is.mcmc.list(samples)) {
+    samples <- list(samples)
+  } else {
+    samples <- list(samples)
+  }
+  
+  sampleCount <- length(samples)
+  
+  # Pre-calculate the number of expected rows
+  rowCount <- 0
+  for (k in 1:sampleCount) {
+    rowCount <- rowCount + nvar(samples[[k]])
+  }
+  
+  columnNames <- c()
+  
+  # Pre-allocate the result data frame
+  result <- data.frame(
+    mean = rep(NaN, rowCount),
+    median = rep(NaN, rowCount),
+    mode = rep(NaN, rowCount),
+    PSD = rep(NaN, rowCount),
+    hdiLow = rep(NaN, rowCount),
+    hdiHigh = rep(NaN, rowCount),
+    quantileLow = rep(NaN, rowCount),
+    quantileHigh = rep(NaN, rowCount),
+    SS = rep(NaN, rowCount),
+    ESS = rep(NaN, rowCount),
+    RHAT = rep(NaN, rowCount),
+    stringsAsFactors = FALSE
+  )
+  
+  currentRow <- 0
+  
+  # Process each model
+  for (k in 1:sampleCount) {
+    prefix <- ""
+    if (sampleCount > 1) {
+      prefix <- paste(k, ".", sep = "")
+    }
+    
+    sample <- samples[[k]]
+    variables <- nvar(sample)
+    varnames_sample <- varnames(sample)
+    iterations <- niter(sample)
+    chains <- nchain(sample)
+    
+    for (j in 1:variables) {
+      currentRow <- currentRow + 1
+      
+      uvalue <- unlist(sample[, j])
+      value <- sample[, j]
+      
+      columnNames <- c(columnNames, paste(prefix, varnames_sample[[j]], sep = ""))
+      
+      result[currentRow, "SS"] <- iterations * chains
+      result[currentRow, "ESS"] <- as.integer(round(effectiveSize(uvalue), 1))
+      result[currentRow, "mean"] <- mean(uvalue)
+      result[currentRow, "median"] <- median(uvalue)
+      
+      mcmcDensity <- density(uvalue)
+      result[currentRow, "mode"] <- mcmcDensity$x[which.max(mcmcDensity$y)]
+      
+      HDI <- HDIofMCMC(uvalue, credMass)
+      result[currentRow, "hdiLow"] <- HDI[1]
+      result[currentRow, "hdiHigh"] <- HDI[2]
+      
+      resultCI <- quantile(uvalue, CI)
+      result[currentRow, "quantileLow"] <- resultCI[1]
+      result[currentRow, "quantileHigh"] <- resultCI[2]
+      
+      result[currentRow, "PSD"] <- sd(uvalue)
+      
+      # Gelman-Rubin RHAT calculation
+      chainmeans <- c()
+      chainvars <- c()
+      for (i in 1:chains) {
+        chain_sum <- sum(value[[i]])
+        chain_var <- var(value[[i]])
+        chain_mean <- chain_sum / iterations
+        chainmeans <- c(chainmeans, chain_mean)
+        chainvars <- c(chainvars, chain_var)
+      }
+      globalmean <- sum(chainmeans) / chains
+      globalvar <- sum(chainvars) / chains
+      
+      # Between-chain variance
+      b <- sum((chainmeans - globalmean)^2) * iterations / (chains - 1)
+      
+      # Marginal posterior variance
+      varplus <- (iterations - 1) * globalvar / iterations + b / iterations
+      
+      # Gelman-Rubin statistic
+      rhat <- sqrt(varplus / globalvar)
+      
+      if(is.na(rhat)) {
+        rhat <- 1
+      }
+      
+      result[currentRow, "RHAT"] <- rhat
+    }
+  }
+  
+  # Round results
+  result <- data.frame(apply(result, 2, function(x) round(x, 4)))
+  
+  # Rename columns
+  if (length(result) > 0) {
+    names(result)[names(result) == 'hdiLow'] <- paste(sprintf("%.0f", 
+      round(credMass * 100, digits = 2)), "HDI_L", sep = "% ")
+    names(result)[names(result) == 'hdiHigh'] <- paste(sprintf("%.0f", 
+      round(credMass * 100, digits = 2)), "HDI_H", sep = "% ")
+    names(result)[names(result) == 'quantileLow'] <- paste("PCI", 
+      sprintf("%.1f%%", round(CI[1] * 100, digits = 3)), sep = " ")
+    names(result)[names(result) == 'quantileHigh'] <- paste("PCI", 
+      sprintf("%.1f%%", round(CI[2] * 100, digits = 3)), sep = " ")
+  }
+  
+  row.names(result) <- columnNames
+  return(result)
+}
+```
+
+# Part 1: Data Generation
+
+This section describes the data generation process for the ml-GAR model. The simulation generates multilevel longitudinal data with both Gompertz growth trends and AR dynamics, following the specifications in Xiong et al. (2025).
+
+## True Parameter Values
+
+Based on the simulation study in the paper, we use the following true parameter values:
+
+| Parameter | Symbol | True Value | Description |
+|-----------|--------|------------|-------------|
+| Asymptote mean | $\mu_{\theta_1}$ | 35 | Population mean of upper limit |
+| Asymptote SD | $\sigma_{\theta_1}$ | 9 | SD of asymptote random effects |
+| Displacement mean | $\mu_{\theta_2}$ | 4 | Population mean of horizontal shift |
+| Displacement SD | $\sigma_{\theta_2}$ | 0.5 | SD of displacement random effects |
+| Growth rate mean | $\mu_{\theta_3}$ | 0.8 | Population mean of growth rate |
+| Growth rate SD | $\sigma_{\theta_3}$ | 0.1 | SD of growth rate random effects |
+| AR mean | $\mu_\phi$ | 0.3 | Population mean of AR coefficient |
+| AR variance | $\sigma^2_\phi$ | 0.01 | Variance of AR random effects |
+| Process noise | $\sigma^2_u$ | 1 | Process noise variance (IIV) |
+
+## Data Generation Function
+
+```{r data-generation-function}
+#' Generate Simulated Data for ml-GAR Model
+#'
+#' @param nP Number of persons (default: 150)
+#' @param nT Number of time points per person (default: 15)
+#' @param seed Random seed for reproducibility
+#' @return A list containing simulated data and true parameter values
+generate_mlGAR_data <- function(nP = 150, nT = 15, seed = 123) {
+  
+  set.seed(seed)
+  
+  # ---- True Parameter Values (from Xiong et al., 2025) ----
+  
+  # Gompertz trend parameters (population means)
+  theta10 <- 35        # Asymptote (upper limit)
+  theta20 <- 4         # Displacement 
+  theta30 <- 0.8       # Growth rate
+  
+  # Gompertz trend parameters (random effect SDs)
+  sigma1 <- 9          # SD of asymptote
+  sigma2 <- 0.5        # SD of displacement
+  sigma3 <- 0.1        # SD of growth rate
+  
+  # Correlation structure for Gompertz parameters (set to 0 for independent)
+  r12 <- 0  # cor(theta_1, theta_2)
+  r13 <- 0  # cor(theta_1, theta_3)
+  r23 <- 0  # cor(theta_2, theta_3)
+  
+  # Covariance matrix for Gompertz parameters
+  Q <- matrix(c(sigma1^2, r12*sigma1*sigma2, r13*sigma1*sigma3,
+                r12*sigma1*sigma2, sigma2^2, r23*sigma2*sigma3,
+                r13*sigma1*sigma3, r23*sigma2*sigma3, sigma3^2), 
+              byrow = TRUE, ncol = 3)
+  
+  # AR parameters
+  AR_mean <- 0.3       # Population mean AR coefficient
+  AR_var <- 0.01       # Variance of AR random effects
+  AR_sd <- sqrt(AR_var)
+  
+  # Process noise variance (IIV)
+  R <- 1               # Measurement/process noise variance
+  
+  # ---- Initialize Storage ----
+  
+  Y <- matrix(NA, nrow = nP, ncol = nT)          # Observed variable
+  MU <- matrix(NA, nrow = nP, ncol = nT)         # Trend (Gompertz) values
+  g <- matrix(NA, nrow = nP, ncol = nT)          # State fluctuations
+  
+  theta1 <- rep(NA, nP)  # Person-specific asymptote
+  theta2 <- rep(NA, nP)  # Person-specific displacement
+  theta3 <- rep(NA, nP)  # Person-specific growth rate
+  AR <- rep(NA, nP)      # Person-specific AR coefficients
+  
+  time <- 1:nT           # Time vector
+  
+  # ---- Simulate Data ----
+  
+  # Generate person-specific Gompertz parameters from multivariate normal
+  theta_means <- c(theta10, theta20, theta30)
+  thetas <- mvrnorm(n = nP, mu = theta_means, Sigma = Q)
+  theta1 <- thetas[, 1]
+  theta2 <- thetas[, 2]
+  theta3 <- thetas[, 3]
+  
+  # Generate person-specific AR coefficients
+  AR <- rnorm(nP, AR_mean, AR_sd)
+  
+  for (i in 1:nP) {
+    # Generate Gompertz trend for all time points
+    for (t in 1:nT) {
+      MU[i, t] <- theta1[i] * exp(-theta2[i] * exp(-time[t] * theta3[i]))
+    }
+    
+    # Generate state fluctuations (AR process)
+    g[i, 1] <- rnorm(1, 0, sqrt(R))  # Initial state
+    for (t in 2:nT) {
+      g[i, t] <- AR[i] * g[i, t-1] + rnorm(1, 0, sqrt(R))
+    }
+    
+    # Observed values = trend + state fluctuations
+    Y[i, ] <- MU[i, ] + g[i, ]
+  }
+  
+  # Create long-format data frame
+  dat_long <- data.frame(
+    id = rep(1:nP, each = nT),
+    time = rep(time, nP),
+    y1 = as.vector(t(Y))
+  )
+  
+  # Return all simulated data and true parameters
+  return(list(
+    # Simulated data
+    Y = Y,
+    MU = MU,
+    g = g,
+    dat_long = dat_long,
+    nP = nP,
+    nT = nT,
+    time = time,
+    
+    # True population parameters
+    theta10 = theta10, sigma1 = sigma1,
+    theta20 = theta20, sigma2 = sigma2,
+    theta30 = theta30, sigma3 = sigma3,
+    AR_mean = AR_mean, AR_var = AR_var,
+    IIV = R,
+    
+    # Person-level parameters
+    theta1 = theta1, theta2 = theta2, theta3 = theta3,
+    AR = AR
+  ))
+}
+```
+
+## Generate Sample Data
+
+```{r generate-sample-data}
+# Generate sample data with N=150 persons and T=15 time points
+# (matching simulation study conditions)
+simdata <- generate_mlGAR_data(nP = 150, nT = 15, seed = 123)
+
+# Display dimensions
+cat("Data dimensions:\n")
+cat("  Number of persons (N):", simdata$nP, "\n")
+cat("  Number of time points (T):", simdata$nT, "\n")
+cat("  Total observations:", nrow(simdata$dat_long), "\n")
+```
+
+## Visualize Simulated Data
+
+```{r visualize-data, fig.cap="Sample trajectories from simulated data. Top: Observed trajectories (solid) with underlying Gompertz trends (dashed). Bottom: State fluctuations (deviations from trend)."}
+# Plot sample trajectories
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+
+# Select a few persons to display
+sample_ids <- c(1, 50, 100)
+colors <- c("blue", "red", "darkgreen")
+
+# Plot observed trajectories with trend
+plot(simdata$time, simdata$Y[sample_ids[1], ], type = "l", col = colors[1],
+     ylim = range(simdata$Y[sample_ids, ]), lwd = 1.5,
+     xlab = "Time", ylab = "Y", main = "Observed Trajectories with Gompertz Trends")
+lines(simdata$time, simdata$MU[sample_ids[1], ], col = colors[1], lty = 2, lwd = 1.5)
+
+for (k in 2:length(sample_ids)) {
+  lines(simdata$time, simdata$Y[sample_ids[k], ], col = colors[k], lwd = 1.5)
+  lines(simdata$time, simdata$MU[sample_ids[k], ], col = colors[k], lty = 2, lwd = 1.5)
+}
+
+legend("bottomright", 
+       legend = c(paste("Person", sample_ids), "Gompertz Trend"),
+       col = c(colors, "black"), 
+       lty = c(rep(1, length(sample_ids)), 2), 
+       lwd = 1.5, cex = 0.8)
+
+# Plot state fluctuations
+plot(simdata$time, simdata$g[sample_ids[1], ], type = "l", col = colors[1],
+     ylim = range(simdata$g[sample_ids, ]), lwd = 1.5,
+     xlab = "Time", ylab = expression(g[t*","*i]), 
+     main = "State Fluctuations (AR Process)")
+abline(h = 0, lty = 3, col = "gray")
+
+for (k in 2:length(sample_ids)) {
+  lines(simdata$time, simdata$g[sample_ids[k], ], col = colors[k], lwd = 1.5)
+}
+
+legend("topright", 
+       legend = paste("Person", sample_ids),
+       col = colors, lty = 1, lwd = 1.5, cex = 0.8)
+```
+
+```{r visualize-all-trajectories, fig.cap="All individual trajectories showing the Gompertz growth pattern with individual variability."}
+# Plot all trajectories using ggplot2
+ggplot(simdata$dat_long, aes(x = time, y = y1, group = id)) +
+  geom_line(alpha = 0.2, color = "steelblue") +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", 
+               color = "red", linewidth = 1.5) +
+  labs(title = "All Individual Trajectories with Mean Trend",
+       subtitle = paste("N =", simdata$nP, ", T =", simdata$nT),
+       x = "Time", y = "Outcome (Y)") +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+# Part 2: Model Fitting with JAGS
+
+## JAGS Model Specification
+
+The following sections walk through the JAGS model implementation of the ml-GAR framework step by step. We break the model into logical components and explain each part in detail.
+
+### Overview of the JAGS Model Structure
+
+The JAGS model consists of several interconnected components:
+
+| Component | Description | Key Parameters |
+|----|----|----|
+| **Trend model** | Gompertz growth curve for each person | `MU[id,t]`, `MU_thetas[id,k]` |
+| **AR dynamics** | Autoregressive process on deviations | `AR[id]` |
+| **Level-2 model** | Random effects distributions | `Level2Mean_*`, `Level2Var_*` |
+| **Priors** | Prior distributions for population parameters | Various hyperparameters |
+
+### Level-1 Model: Observation and Trend
+
+The first code block handles the observation model for each person `id`. At each time point `t`:
+
+-   **Gompertz trend**: We compute the expected value based on the Gompertz growth function
+-   **AR dynamics**: The observation is modeled as the trend plus AR-dependent deviations
+
+``` jags
+for (id in ids) { # opening loop for person (id)
+  # model for the first point (t=1)
+  Obs[1,2,id] ~ dnorm(MU[id,1], 1/IIV)
+  MU[id,1] <- MU_thetas[id,1]*exp(-MU_thetas[id,2]*exp(-Obs[1,1,id]*MU_thetas[id,3]))
+  
+  # model for the rest (t=2 to T)
+  for (t in 2:nT) { # opening loop for observation (t)
+    Obs[t,2,id] ~ dnorm(MU[id,t] + AR[id]*(Obs[t-1,2,id]-MU[id,t-1]), 1/IIV)
+    MU[id,t] <- MU_thetas[id,1]*exp(-MU_thetas[id,2]*exp(-Obs[t,1,id]*MU_thetas[id,3]))
+  } # closing loop for observation (t)
+```
+
+**Key points about the observation model:**
+
+-   `MU[id,t]`: The Gompertz trend for person `id` at time `t`, computed as $\theta_{1,i} \exp(-\theta_{2,i} \exp(-t \cdot \theta_{3,i}))$
+-   `AR[id]*(Obs[t-1,2,id]-MU[id,t-1])`: The AR component captures carry-over from the previous deviation
+-   `1/IIV`: JAGS uses precision (inverse variance), so we specify `1/IIV` where `IIV` is the process noise variance
+
+### Level-2 Model: Person-Specific Parameters
+
+The person-specific parameters are drawn from normal distributions centered at the population means. Note that the individual AR coefficients (`AR[id]`) are **not** truncated—only the population mean (`Level2MeanAR`) has the stationarity constraint:
+
+``` jags
+# PART 2. Specifying Level-2 model
+  AR[id] ~ dnorm(Level2MeanAR, 1/pow(Level2Sd_AR,2))
+  MU_thetas[id,1] ~ dnorm(Level2Mean_theta1, 1/pow(Level2Sd_theta1,2))
+  MU_thetas[id,2] ~ dnorm(Level2Mean_theta2, 1/pow(Level2Sd_theta2,2)) 
+  MU_thetas[id,3] ~ dnorm(Level2Mean_theta3, 1/pow(Level2Sd_theta3,2)) 
+    
+} # closing loop for person (id)
+```
+
+**Understanding the Level-2 parameters:**
+
+-   `Level2MeanAR`: Population mean of AR coefficients ($\mu_\phi$)
+-   `Level2Sd_AR`: Standard deviation of AR random effects ($\sigma_\phi$)
+-   `Level2Mean_thetak`: Population mean of Gompertz parameter $k$ ($\mu_{\theta_k}$)
+-   `Level2Sd_thetak`: Standard deviation of Gompertz parameter $k$ ($\sigma_{\theta_k}$)
+
+### Prior Specifications
+
+The priors section specifies our prior beliefs about the population-level parameters. We use weakly informative priors that provide reasonable bounds without imposing strong assumptions, following Table 3 in Xiong et al. (2025).
+
+``` jags
+# PART 3. Specifying prior distributions 
+
+# AR parameters
+Level2MeanAR ~ dnorm(0,1)T(-1,1)  # Truncated for stationarity
+Level2Sd_AR ~ dunif(0,1)
+Level2Var_AR = pow(Level2Sd_AR,2)
+
+# Gompertz trend parameters
+Level2Mean_theta1 ~ dunif(20, 50)     # Asymptote
+Level2Mean_theta2 ~ dunif(0, 15)      # Displacement
+Level2Mean_theta3 ~ dunif(0.5, 1.5)   # Growth rate
+
+Level2Sd_theta1 ~ dunif(0.01, 15)     # SD of asymptote
+Level2Sd_theta2 ~ dunif(0.01, 2)      # SD of displacement
+Level2Sd_theta3 ~ dunif(0.01, 1)      # SD of growth rate
+
+Level2Var_theta1 = pow(Level2Sd_theta1, 2)
+Level2Var_theta2 = pow(Level2Sd_theta2, 2)
+Level2Var_theta3 = pow(Level2Sd_theta3, 2)
+
+# Process noise variance (IIV)
+IIV <- exp(logIIV)   
+logIIV ~ dunif(-4.605170, 1.83)  # log(c(0.01, 6.25))
+```
+
+**Summary of prior specifications (Table 3 in paper):**
+
+| Parameter | Prior Distribution | Rationale |
+|-----------|-------------------|-----------|
+| `Level2MeanAR` | $N(0,1)T(-1,1)$ | Truncated normal ensures stationarity |
+| `Level2Sd_AR` | $U(0,1)$ | Weakly informative for SD |
+| `Level2Mean_theta1` | $U(20,50)$ | Based on expected asymptote range |
+| `Level2Mean_theta2` | $U(0,15)$ | Based on expected displacement |
+| `Level2Mean_theta3` | $U(0.5,1.5)$ | Based on expected growth rate |
+| `log(IIV)` | $U(\log(0.01), \log(6.25))$ | Log-scale for variance |
+
+### Complete JAGS Model Code
+
+Now we combine all the components into a single model string:
+
+```{r jags-model-spec}
+# Define JAGS model as a string (matching original code)
+jags_model_string <- "
+model {
+# PART 1. Specifying Level-1 model
+  for (id in ids) { # opening loop for person (id)
+    # model for the first point (t=1)
+    Obs[1,2,id] ~ dnorm(MU[id,1], 1/IIV)
+    MU[id,1] <- MU_thetas[id,1]*exp(-MU_thetas[id,2]*exp(-Obs[1,1,id]*MU_thetas[id,3]))
+    
+    # model for the rest
+    for (t in 2:nT) { # opening loop for observation (t)
+      Obs[t,2,id] ~ dnorm(MU[id,t] + AR[id]*(Obs[t-1,2,id]-MU[id,t-1]), 1/IIV)
+      MU[id,t] <- MU_thetas[id,1]*exp(-MU_thetas[id,2]*exp(-Obs[t,1,id]*MU_thetas[id,3]))
+    } # closing loop for observation (t)
+    
+# PART 2. Specifying Level-2 model
+  AR[id] ~ dnorm(Level2MeanAR, 1/pow(Level2Sd_AR,2))
+  MU_thetas[id,1] ~ dnorm(Level2Mean_theta1, 1/pow(Level2Sd_theta1,2))
+  MU_thetas[id,2] ~ dnorm(Level2Mean_theta2, 1/pow(Level2Sd_theta2,2)) 
+  MU_thetas[id,3] ~ dnorm(Level2Mean_theta3, 1/pow(Level2Sd_theta3,2)) 
+    
+ } # closing loop for person (id)       
+      
+# PART 3. Specifying prior distributions 
+  # AR
+    Level2MeanAR ~ dnorm(0,1)T(-1,1)
+    Level2Sd_AR ~ dunif(0,1)
+    Level2Var_AR = pow(Level2Sd_AR,2)
+    
+  # Gompertz trend parameters (MU)
+    Level2Mean_theta1 ~ dunif(20, 50)
+    Level2Mean_theta2 ~ dunif(0, 15)
+    Level2Mean_theta3 ~ dunif(0.5, 1.5)
+    Level2Sd_theta1 ~ dunif(0.01, 15)
+    Level2Sd_theta2 ~ dunif(0.01, 2)
+    Level2Sd_theta3 ~ dunif(0.01, 1)
+    Level2Var_theta1 = pow(Level2Sd_theta1, 2)
+    Level2Var_theta2 = pow(Level2Sd_theta2, 2)
+    Level2Var_theta3 = pow(Level2Sd_theta3, 2)
+    
+  # Process noise variance (IIV)
+    IIV <- exp(logIIV)   
+    logIIV ~ dunif(-4.605170, 1.83)
+}
+"
+
+# Write model to a temporary file
+model_file <- tempfile(fileext = ".txt")
+writeLines(jags_model_string, model_file)
+cat("JAGS model saved to:", model_file, "\n")
+```
+
+## Prepare Data for JAGS
+
+```{r prepare-jags-data}
+# Convert data to array format for JAGS
+# Obs array: [time, variable, person]
+# variable 1 = time, variable 2 = outcome
+
+nT <- simdata$nT
+nP <- simdata$nP
+ids <- 1:nP
+ydim <- 1  # dimension of outcome variables
+
+# Initialize observation array
+Obs_empty <- rep(NA, nP * nT * (ydim + 1))
+Obs <- array(Obs_empty, dim = c(nT, (ydim + 1), nP))
+
+for (i in ids) {
+  Obs[, 1, i] <- simdata$time        # Time variable
+  Obs[, 2, i] <- simdata$Y[i, ]      # Outcome variable
+}
+
+# Check data for id=1
+cat("Data for id=1 (columns = time, y1):\n")
+print(Obs[, , 1])
+
+# Prepare data list for JAGS
+jagsData <- list(
+  Obs = Obs,
+  ids = ids,
+  nT = nT
+)
+
+# Display data structure
+cat("\nJAGS data structure:\n")
+cat("  Obs array dimensions:", dim(Obs), "(time x variables x persons)\n")
+cat("  Number of persons:", length(ids), "\n")
+cat("  Number of time points:", nT, "\n")
+```
+
+## MCMC Settings
+
+The following settings match those used in the simulation study (Xiong et al., 2025):
+
+```{r mcmc-settings}
+# Level-2 parameters to summarize
+summ_rownames <- c("IIV", "Level2MeanAR", "Level2Var_AR",
+                   "Level2Mean_theta1", "Level2Var_theta1",
+                   "Level2Mean_theta2", "Level2Var_theta2",
+                   "Level2Mean_theta3", "Level2Var_theta3")
+
+# Parameters to track
+parameters <- c("AR", "MU", "MU_thetas", summ_rownames)
+
+# MCMC settings (based on Xiong et al., 2025 paper description)
+adaptation <- 5000     # Adaptation iterations
+burnin <- 10000        # Burn-in iterations
+chains <- 2            # Number of MCMC chains
+thinning <- 2          # Thinning interval (paper uses 2)
+nrOfIter <- 10000      # Number of iterations for posterior sampling
+
+# Fixed initial values for reproducibility
+fixedinits <- list(
+  list(.RNG.seed = 6, .RNG.name = "base::Mersenne-Twister"),
+  list(.RNG.seed = 11, .RNG.name = "base::Mersenne-Twister")
+)
+
+cat("MCMC Settings (based on Xiong et al., 2025):\n")
+cat("  Chains:", chains, "\n")
+cat("  Adaptation:", adaptation, "\n")
+cat("  Burn-in:", burnin, "\n")
+cat("  Sampling iterations:", nrOfIter, "\n")
+cat("  Thinning:", thinning, "\n")
+cat("  Posterior samples per chain:", nrOfIter / thinning, "\n")
+```
+
+## Run JAGS Model
+
+```{r run-jags, results='hide'}
+# Track computation time
+main_t_start <- proc.time()
+
+# Initialize JAGS model
+cat("Initializing JAGS model...\n")
+jagsModel <- jags.model(
+  file = model_file, 
+  data = jagsData, 
+  n.chains = chains, 
+  n.adapt = adaptation,
+  inits = fixedinits
+)
+
+# Burn-in
+cat("Running burn-in (", burnin, " iterations)...\n", sep = "")
+update(jagsModel, n.iter = burnin)
+
+# Sample from posterior
+cat("Sampling from posterior (", nrOfIter, " iterations, thin = ", thinning, ")...\n", sep = "")
+codaSamples <- coda.samples(
+  jagsModel, 
+  variable.names = parameters, 
+  n.iter = nrOfIter,
+  thin = thinning
+)
+
+main_t_end <- proc.time()
+main_t_elapsed <- main_t_end - main_t_start
+cat("MCMC sampling complete!\n")
+cat("Total computation time:", round(main_t_elapsed[3], 2), "seconds\n")
+```
+
+# Part 3: Results and Diagnostics
+
+## Parameter Estimates
+
+```{r parameter-estimates}
+# Generate summary statistics
+resulttable <- summarizePost(codaSamples)
+
+# Display results for population-level parameters
+cat("\n=== Population Parameter Estimates ===\n\n")
+print(resulttable[summ_rownames, c("mean", "PSD", "95% HDI_L", "95% HDI_H", "ESS", "RHAT")])
+```
+
+## Compare Estimates to True Values
+
+```{r compare-true-values}
+# Create comparison table
+true_values <- c(
+  IIV = simdata$IIV,
+  Level2MeanAR = simdata$AR_mean,
+  Level2Var_AR = simdata$AR_var,
+  Level2Mean_theta1 = simdata$theta10,
+  Level2Var_theta1 = simdata$sigma1^2,
+  Level2Mean_theta2 = simdata$theta20,
+  Level2Var_theta2 = simdata$sigma2^2,
+  Level2Mean_theta3 = simdata$theta30,
+  Level2Var_theta3 = simdata$sigma3^2
+)
+
+comparison <- data.frame(
+  Parameter = names(true_values),
+  True = true_values,
+  Estimate = resulttable[names(true_values), "mean"],
+  PSD = resulttable[names(true_values), "PSD"],
+  HDI_Low = resulttable[names(true_values), "95% HDI_L"],
+  HDI_High = resulttable[names(true_values), "95% HDI_H"],
+  row.names = NULL
+)
+
+comparison$Bias <- comparison$Estimate - comparison$True
+comparison$rBias <- comparison$Bias / comparison$True
+comparison$Coverage <- ifelse(comparison$True >= comparison$HDI_Low & 
+                               comparison$True <= comparison$HDI_High, 
+                             "Yes", "No")
+
+cat("\n=== Comparison with True Values ===\n\n")
+print(comparison, digits = 3)
+```
+
+## Convergence Diagnostics
+
+### RHAT and ESS Summary
+
+```{r convergence-summary}
+# Check convergence via RHAT and ESS for Level-2 parameters
+convergence_table <- data.frame(
+  Parameter = summ_rownames,
+  ESS = resulttable[summ_rownames, "ESS"],
+  RHAT = resulttable[summ_rownames, "RHAT"]
+)
+
+cat("\n=== Convergence Summary (Level-2 Parameters) ===\n\n")
+print(convergence_table, row.names = FALSE)
+
+max_rhat <- max(convergence_table$RHAT, na.rm = TRUE)
+min_ess <- min(convergence_table$ESS, na.rm = TRUE)
+
+cat("\nMaximum RHAT:", round(max_rhat, 4), "\n")
+cat("Minimum ESS:", min_ess, "\n")
+
+if (max_rhat < 1.1 & min_ess >= 250) {
+  cat("Conclusion: All chains appear to have converged (RHAT < 1.1, ESS >= 250).\n")
+} else {
+  cat("Note: Consider increasing iterations for more reliable inference.\n")
+}
+```
+
+### Trace Plots
+
+```{r convergence-plot, fig.cap="Trace plots and density plots for key population parameters."}
+# Select key parameters for visualization
+key_params <- c("Level2MeanAR", "Level2Var_AR", "Level2Mean_theta1", "IIV")
+
+# Check if parameters exist in samples
+available_params <- key_params[key_params %in% varnames(codaSamples)]
+
+if (length(available_params) > 0) {
+  # Extract samples for key parameters
+  samples_subset <- codaSamples[, available_params]
+  
+  # Plot trace and density
+  plot(samples_subset)
+}
+```
+
+## Visualize Parameter Recovery
+
+```{r parameter-recovery-plot, fig.cap="Parameter recovery: Estimated values (points with 95% HDIs) compared to true values (red X marks)."}
+# Create visualization of parameter recovery for means only
+comparison_means <- comparison[!grepl("Var", comparison$Parameter), ]
+
+if (nrow(comparison_means) > 0) {
+  ggplot(comparison_means, aes(x = Parameter, y = Estimate)) +
+    geom_point(size = 3, color = "steelblue") +
+    geom_errorbar(aes(ymin = HDI_Low, ymax = HDI_High), 
+                  width = 0.2, color = "steelblue") +
+    geom_point(aes(y = True), shape = 4, size = 4, color = "red", stroke = 1.5) +
+    labs(title = "Parameter Recovery: Estimates vs. True Values",
+         subtitle = "Blue points = estimates with 95% HDI; Red X = true values",
+         x = "Parameter", y = "Value") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(face = "bold")
+    )
+}
+```
+
+# Summary
+
+This tutorial demonstrated:
+  
+1.  **Model Conceptualization**: The ml-GAR model integrates Gompertz growth trends with multilevel AR dynamics to simultaneously capture gradual developmental changes and momentary state fluctuations.
+
+2.  **Data Generation**: How to simulate data from the ml-GAR model with parameters matching Xiong et al. (2025):
+    -   Gompertz parameters: $\mu_{\theta_1} = 35$, $\mu_{\theta_2} = 4$, $\mu_{\theta_3} = 0.8$
+    -   Random effect SDs: $\sigma_{\theta_1} = 9$, $\sigma_{\theta_2} = 0.5$, $\sigma_{\theta_3} = 0.1$
+    -   AR dynamics: $\mu_\phi = 0.3$, $\sigma^2_\phi = 0.01$
+    -   Process noise: $\sigma^2_u = 1$
+
+3.  **Model Specification**: The JAGS model syntax implementing the hierarchical structure with:
+    -   Level-1: Observation model with Gompertz trend and AR dynamics
+    -   Level-2: Random effects for person-specific parameters (AR not truncated at individual level)
+    -   Priors: Weakly informative priors as specified in Table 3 of the paper
+
+4.  **Model Fitting**: Using `rjags` with settings based on the paper:
+    -   Adaptation: `r adaptation` iterations
+    -   Burn-in: `r burnin` iterations
+    -   Sampling: `r nrOfIter` iterations per chain
+    -   Chains: `r chains`
+    -   Thinning: `r thinning` (yielding `r nrOfIter/thinning` samples per chain)
+
+5.  **Post-Analysis**: Comprehensive diagnostics including:
+    -   Parameter estimates with posterior SDs and HDIs
+    -   Comparison with true values (bias, relative bias, coverage)
+    -   Convergence diagnostics (ESS, RHAT)
+
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
+
+-   Asparouhov, T., & Muthén, B. (2010). Bayesian analysis using Mplus: Technical implementation. Muthén & Muthén.
+-   Gates, K. M., Chow, S.-M., & Molenaar, P. C. M. (2023). *Intensive longitudinal analysis of human processes*. Chapman and Hall/CRC.
+-   Ji, L., Chow, S.-M., Schermerhorn, A. C., Jacobson, N. C., & Cummings, E. M. (2020). Handling missing data in the modeling of intensive longitudinal data. *Structural Equation Modeling: A Multidisciplinary Journal*, 27(5), 715–736.
+-   Li, Y., Oravecz, Z., Zhou, S., Bodber, Y., & Chow, S.-M. (2022). Bayesian forecasting with a regime-switching zero-inflated multilevel Poisson regression model: An application to adolescent alcohol use with selective missingness. *Psychometrika*, 87(3), 978–1008.
+-   Plummer, M. (2003). JAGS: A program for analysis of Bayesian graphical models using Gibbs sampling. In *Proceedings of the 3rd International Workshop on Distributed Statistical Computing*.
+-   Xiong, X., Li, Y., Hunter, M. D., & Chow, S.-M. (2025). Integrated trend and lagged modeling of multi-subject, multilevel, and short time series. *Multivariate Behavioral Research*. https://doi.org/10.1080/00273171.2025.2587286
