@@ -32,7 +32,7 @@ Basic steps:
 
 1. Prepare data as a 3D array: `[time, variable, person]`.
 2. Write the JAGS model. The core structure is a Level-1 observation model (Gompertz trend + AR state) and Level-2 random effect distributions.
-3. Run MCMC. The tutorial uses 4 chains with 20,000 iterations (thinning = 10), which works for simulated data. Real data may need tuning.
+3. Run MCMC. The tutorial uses 2 chains, 5000 adaptation, 10000 burn-in, 10000 sampling iterations with thinning = 2. Real data may need tuning.
 4. Check convergence via RHAT (< 1.1) and ESS (higher is better).
 
 ## Model structure
